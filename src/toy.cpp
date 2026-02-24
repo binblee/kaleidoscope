@@ -1,4 +1,5 @@
 // #include <algorithm>
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <vector>
 #include "llvm/ADT/APFloat.h"
 // #include "llvm/ADT/STLExtras.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -16,11 +18,24 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "KaleidoscopeJIT.h"
 
 using namespace llvm;
+using namespace llvm::orc;
 //
 // Lexer
 //
@@ -321,6 +336,15 @@ static std::unique_ptr<FunctionAST> ParseDefinition() {
     return nullptr;
 }
 
+// toplevelexpr ::= expression
+static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
+    if (auto E = ParseExpression()) {
+        auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
+        return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+    }
+    return nullptr;
+}
+
 // external ::= 'extern' prototype
 static std::unique_ptr<PrototypeAST> ParseExtern() {
     getNextToken();
@@ -334,8 +358,31 @@ static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, Value *> NamedValues;
-Value *LogErrorV(const char *Str);
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static ExitOnError ExitOnErr;
 
+Function *getFunction(std::string Name) {
+    // First, see if the function has already been added to the current module.
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    // If not, check whether we can codegen the declaration from some existing
+    // prototype.
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
 Value *NumberExprAST::codegen() {
     return ConstantFP::get(*TheContext, APFloat(Val));
 }
@@ -365,7 +412,8 @@ Value *BinaryExprAST::codegen() {
 }
 
 Value *CallExprAST::codegen() {
-    Function *CalleeF = TheModule->getFunction(Callee);
+    // Look up the name in the global module table.
+    Function *CalleeF = getFunction(Callee);
     if (!CalleeF)
         return LogErrorV("Unknown function referenced");
 
@@ -393,24 +441,13 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-    Function *TheFunction = TheModule->getFunction(Proto->getName());
-    if (!TheFunction)
-        TheFunction = Proto->codegen();
-    // This code does have a bug, though:
-    // If the FunctionAST::codegen() method finds an existing IR Function,
-    // it does not validate its signature against the definition’s own prototype.
-    // This means that an earlier ‘extern’ declaration will take precedence over the function definition’s signature,
-    // which can cause codegen to fail, for instance if the function arguments are named differently.
-    // There are a number of ways to fix this bug, see what you can come up with! Here is a testcase:
-    // ```
-    // extern foo(a);     # ok, defines foo.
-    // def foo(b) b;      # Error: Unknown variable name. (decl using 'a' takes precedence).
-
+    // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+    // reference to it for use below.
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    Function *TheFunction = getFunction(P.getName());
     if (!TheFunction)
         return nullptr;
-
-    if (!TheFunction->empty())
-        return (Function*)LogErrorV("Function cannot be redefined.");
 
     // create a new basic block to start insertion to.
     BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
@@ -422,8 +459,12 @@ Function *FunctionAST::codegen() {
         NamedValues[std::string(Arg.getName())] = &Arg;
 
     if (Value *RetVal = Body->codegen()) {
+        // Finish off the function.
         Builder->CreateRet(RetVal);
+        // Validate the generated code, checking for consistency.
         verifyFunction(*TheFunction);
+        // Optimize the function.
+        TheFPM->run(*TheFunction, *TheFAM);
         return TheFunction;
     }
 
@@ -432,23 +473,40 @@ Function *FunctionAST::codegen() {
     return nullptr;
 }
 
-// toplevelexpr ::= expression
-static int anonymousFunctionCounter = 0;
-static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
-    if (auto E = ParseExpression()) {
-        auto Proto = std::make_unique<PrototypeAST>("__anno_expr_" + std::to_string(++anonymousFunctionCounter), std::vector<std::string>());
-        return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
-    }
-    return nullptr;
-}
-
 //
 // top level parsing and JIT driver
 //
-static void InitializeModule() {
+static void InitializeModuleAndManagers() {
     TheContext = std::make_unique<LLVMContext>();
-    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    TheModule = std::make_unique<Module>("KaleidoscopeJIT", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
+
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+    // new pass and analysis managers
+    TheFPM = std::make_unique<FunctionPassManager>();
+    TheLAM = std::make_unique<LoopAnalysisManager>();
+    TheFAM = std::make_unique<FunctionAnalysisManager>();
+    TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+    TheMAM = std::make_unique<ModuleAnalysisManager>();
+    ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+    TheSI = std::make_unique<StandardInstrumentations>(*TheContext,
+                                                        true /* debug logging */);
+    TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+    // Add transform passes.
+    // Do simple "peephole" optimizations and bit-twiddling optzns.
+    TheFPM->addPass(InstCombinePass());
+    // Reassociate expressions.
+    TheFPM->addPass(ReassociatePass());
+    // Eliminate Common SubExpressions.
+    TheFPM->addPass(GVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc).
+    TheFPM->addPass(SimplifyCFGPass());
+    // Register analysis passes used in these transform passes.
+    PassBuilder PB;
+    PB.registerModuleAnalyses(*TheMAM);
+    PB.registerFunctionAnalyses(*TheFAM);
+    PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 }
 static void HandleDefinition() {
     if (auto FnAST = ParseDefinition()) {
@@ -456,6 +514,9 @@ static void HandleDefinition() {
             fprintf(stderr, "Read function definition:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            ExitOnErr(TheJIT->addModule(
+                ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+            InitializeModuleAndManagers();
         }
     } else {
         getNextToken();
@@ -468,6 +529,7 @@ static void HandleExtern() {
             fprintf(stderr, "Read extern:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
         }
     } else {
         getNextToken();
@@ -476,12 +538,25 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
     if (auto FnAST = ParseTopLevelExpr()) {
-        if (auto *FnIR = FnAST->codegen()) {
-            fprintf(stderr, "Read top-level expr:\n");
-            FnIR->print(errs());
-            fprintf(stderr, "\n");
-            // NO need to remove the anonymous expression since we have suffix appended to function name
-            // FnIR->eraseFromParent();
+        if (FnAST->codegen()) {
+            // Create a ResourceTracker to track JIT'd memory allocated to our
+            // anonymous expression -- that way we can free it after executing.
+            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            InitializeModuleAndManagers();
+
+            // Search the JIT for the __anon_expr symbol.
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+            // Get the symbol's address and cast it to the right type (takes no
+            // arguments, returns a double) so we can call it as a native function.
+            double (*FP)() = ExprSymbol.toPtr<double (*)()>();
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            // Delete the anonymous expression module from the JIT.
+            ExitOnErr(RT->remove());
         }
     } else {
         getNextToken();
@@ -511,7 +586,33 @@ static void MainLoop() {
     }
 }
 
+//
+// "Library" functions that can be "extern'd" from user code.
+//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+    fputc((char)X, stderr);
+    return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+    fprintf(stderr, "%f\n", X);
+    return 0;
+}
+
 int main(int argc, const char **argv) {
+
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
 
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
@@ -521,91 +622,41 @@ int main(int argc, const char **argv) {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    InitializeModule();
+    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+    InitializeModuleAndManagers();
 
     MainLoop();
-
-    TheModule->print(errs(), nullptr);
 
     return 0;
 }
 
 /*
- *
-ready> 4+5;
-ready> Read top-level expr:
-define double @__anno_expr_1() {
-entry:
-ret double 9.000000e+00
-}
+    ready> extern sin(x);
+    ready> Read extern:
+    declare double @sin(double)
 
-ready> def foo(a b) a*a + 2*a*b + b*b;
-ready> Read function definition:
-define double @foo(double %a, double %b) {
-entry:
-%multmp = fmul double %a, %a
-%multmp1 = fmul double 2.000000e+00, %a
-%multmp2 = fmul double %multmp1, %b
-%addtmp = fadd double %multmp, %multmp2
-%multmp3 = fmul double %b, %b
-%addtmp4 = fadd double %addtmp, %multmp3
-ret double %addtmp4
-}
+    ready> extern cos(x);
+    ready> Read extern:
+    declare double @cos(double)
 
-ready> def bar(a) foo(a, 4.0) + bar(31337);
-ready> Read function definition:
-define double @bar(double %a) {
-entry:
-%calltmp = call double @foo(double %a, double 4.000000e+00)
-%calltmp1 = call double @bar(double 3.133700e+04)
-%addtmp = fadd double %calltmp, %calltmp1
-ret double %addtmp
-}
+    ready> sin(1.0);
+    ready> Evaluated to 0.841471
+    ready> def foo(x) sin(x)*sin(x) + cos(x)*cos(x);
+    ready> Read function definition:
+    define double @foo(double %x) {
+    entry:
+      %calltmp = call double @sin(double %x)
+      %calltmp1 = call double @sin(double %x)
+      %multmp = fmul double %calltmp, %calltmp1
+      %calltmp2 = call double @cos(double %x)
+      %calltmp3 = call double @cos(double %x)
+      %multmp4 = fmul double %calltmp2, %calltmp3
+      %addtmp = fadd double %multmp, %multmp4
+      ret double %addtmp
+    }
 
-ready> extern cos(x);
-ready> Read extern:
-declare double @cos(double)
-
-ready> cos(1.234);
-ready> Read top-level expr:
-define double @__anno_expr_2() {
-entry:
-%calltmp = call double @cos(double 1.234000e+00)
-ret double %calltmp
-}
-
-ready> ready> ; ModuleID = 'my cool jit'
-source_filename = "my cool jit"
-
-define double @__anno_expr_1() {
-entry:
-ret double 9.000000e+00
-}
-
-define double @foo(double %a, double %b) {
-entry:
-%multmp = fmul double %a, %a
-%multmp1 = fmul double 2.000000e+00, %a
-%multmp2 = fmul double %multmp1, %b
-%addtmp = fadd double %multmp, %multmp2
-%multmp3 = fmul double %b, %b
-%addtmp4 = fadd double %addtmp, %multmp3
-ret double %addtmp4
-}
-
-define double @bar(double %a) {
-entry:
-%calltmp = call double @foo(double %a, double 4.000000e+00)
-%calltmp1 = call double @bar(double 3.133700e+04)
-%addtmp = fadd double %calltmp, %calltmp1
-ret double %addtmp
-}
-
-declare double @cos(double)
-
-define double @__anno_expr_2() {
-entry:
-%calltmp = call double @cos(double 1.234000e+00)
-ret double %calltmp
-}
-*/
+    ready> foo(4.0);
+    ready> Evaluated to 1.000000
+    ready>
+ */
