@@ -538,7 +538,9 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
     if (auto FnAST = ParseTopLevelExpr()) {
-        if (FnAST->codegen()) {
+        if (auto FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Read toplevel expr:\n");
+            FnIR->print(errs());
             // Create a ResourceTracker to track JIT'd memory allocated to our
             // anonymous expression -- that way we can free it after executing.
             auto RT = TheJIT->getMainJITDylib().createResourceTracker();
